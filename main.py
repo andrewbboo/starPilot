@@ -1,26 +1,26 @@
 import os
 os.add_dll_directory("C:\\bin\\gstreamer\\1.0\\msvc_x86_64\\bin")
-#test test test
 import sys
 import cv2
 import numpy as np
 import json
+import os
+import subprocess
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QCheckBox,
-                             QTabWidget, QGridLayout, QProgressBar)
+                             QTabWidget, QGridLayout, QProgressBar, QTextEdit)
 from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter, QColor
 from PyQt5.QtCore import Qt, QTimer, QSize, QEvent
 from pymavlink import mavutil
 import threading
 import time
-import os
 
 
 class VideoTelemetryWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video and Telemetry with Enhanced OSD")
-        self.setGeometry(100, 100, 1000, 600)  # Increased height for more UI space
+        self.setGeometry(100, 100, 1000, 600)
 
         # GStreamer pipeline
         self.pipeline_str = (
@@ -33,11 +33,11 @@ class VideoTelemetryWindow(QMainWindow):
 
         # Video capture
         self.cap = cv2.VideoCapture(self.pipeline_str, cv2.CAP_GSTREAMER)
-        self.video_writer = None
+        self.video_writer_osd = None
+        self.video_writer_raw = None
 
         # MAVLink connection
         self.mavlink_conn = None
-        self.connect_mavlink()
 
         # Video parameters
         self.frame_width = 640
@@ -45,6 +45,7 @@ class VideoTelemetryWindow(QMainWindow):
 
         # Recording state
         self.is_recording = False
+        self.recording_path = ""
 
         # OSD elements configuration
         self.osd_elements = {
@@ -67,10 +68,10 @@ class VideoTelemetryWindow(QMainWindow):
         self.vibration_data = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'clip': 0}
         self.ekf_status = {
             'flags': 0,
-            'velocity': 0.0,  # Velocity variance
-            'pos_horiz': 0.0,  # Position horizontal variance
-            'pos_vert': 0.0,  # Position vertical variance
-            'compass': 0.0  # Compass variance
+            'velocity': 0.0,
+            'pos_horiz': 0.0,
+            'pos_vert': 0.0,
+            'compass': 0.0
         }
 
         # Initialize osd_checkboxes
@@ -78,6 +79,9 @@ class VideoTelemetryWindow(QMainWindow):
 
         # GUI setup
         self.setup_ui()
+
+        # MAVLink connection
+        self.connect_mavlink()
 
         # Load OSD settings after UI setup
         self.load_osd_settings()
@@ -133,7 +137,8 @@ class VideoTelemetryWindow(QMainWindow):
         self.position_label = QLabel("Position: Lat: 0.0, Lon: 0.0, Alt: 0.0m")
         self.battery_label = QLabel("Battery: 0%")
 
-        # Vibration bars (vertical)
+        # Vibration and EKF bars in one row
+        status_layout = QHBoxLayout()
         self.vibe_x_bar = QProgressBar()
         self.vibe_x_bar.setMaximum(100)
         self.vibe_x_bar.setOrientation(Qt.Vertical)
@@ -143,9 +148,6 @@ class VideoTelemetryWindow(QMainWindow):
         self.vibe_z_bar = QProgressBar()
         self.vibe_z_bar.setMaximum(100)
         self.vibe_z_bar.setOrientation(Qt.Vertical)
-        self.vibe_label = QLabel("Vibration: X: 0.0, Y: 0.0, Z: 0.0, Clip: 0")
-
-        # EKF status bars (vertical)
         self.ekf_vel_bar = QProgressBar()
         self.ekf_vel_bar.setMaximum(100)
         self.ekf_vel_bar.setOrientation(Qt.Vertical)
@@ -158,44 +160,56 @@ class VideoTelemetryWindow(QMainWindow):
         self.ekf_comp_bar = QProgressBar()
         self.ekf_comp_bar.setMaximum(100)
         self.ekf_comp_bar.setOrientation(Qt.Vertical)
+
+        status_layout.addWidget(QLabel("Vibe X"))
+        status_layout.addWidget(self.vibe_x_bar)
+        status_layout.addWidget(QLabel("Y"))
+        status_layout.addWidget(self.vibe_y_bar)
+        status_layout.addWidget(QLabel("Z"))
+        status_layout.addWidget(self.vibe_z_bar)
+        status_layout.addWidget(QLabel("EKF Vel"))
+        status_layout.addWidget(self.ekf_vel_bar)
+        status_layout.addWidget(QLabel("PosH"))
+        status_layout.addWidget(self.ekf_pos_h_bar)
+        status_layout.addWidget(QLabel("PosV"))
+        status_layout.addWidget(self.ekf_pos_v_bar)
+        status_layout.addWidget(QLabel("Comp"))
+        status_layout.addWidget(self.ekf_comp_bar)
+
+        self.vibe_label = QLabel("Vibration: X: 0.0, Y: 0.0, Z: 0.0, Clip: 0")
         self.ekf_label = QLabel("EKF Status: OK")
 
-        # Layout for bars
-        vibe_layout = QHBoxLayout()
-        vibe_layout.addWidget(QLabel("X"))
-        vibe_layout.addWidget(self.vibe_x_bar)
-        vibe_layout.addWidget(QLabel("Y"))
-        vibe_layout.addWidget(self.vibe_y_bar)
-        vibe_layout.addWidget(QLabel("Z"))
-        vibe_layout.addWidget(self.vibe_z_bar)
-
-        ekf_layout = QHBoxLayout()
-        ekf_layout.addWidget(QLabel("Vel"))
-        ekf_layout.addWidget(self.ekf_vel_bar)
-        ekf_layout.addWidget(QLabel("PosH"))
-        ekf_layout.addWidget(self.ekf_pos_h_bar)
-        ekf_layout.addWidget(QLabel("PosV"))
-        ekf_layout.addWidget(self.ekf_pos_v_bar)
-        ekf_layout.addWidget(QLabel("Comp"))
-        ekf_layout.addWidget(self.ekf_comp_bar)
+        # Recording layout with label and button
+        record_layout = QHBoxLayout()
+        self.record_label = QLabel("Recording: Not active")
+        self.open_folder_button = QPushButton("Open Folder")
+        self.open_folder_button.clicked.connect(self.open_recording_folder)
+        self.open_folder_button.setEnabled(False)
+        record_layout.addWidget(self.record_label)
+        record_layout.addWidget(self.open_folder_button)
 
         self.record_button = QPushButton(" Record")
         self.record_button.setMinimumWidth(100)
         self.update_record_button_icon()
         self.record_button.clicked.connect(self.toggle_recording)
 
+        # Status bar (textarea)
+        self.status_bar = QTextEdit()
+        self.status_bar.setReadOnly(True)
+        self.status_bar.setMaximumHeight(100)
+        self.status_bar.setText("Application started")
+
         telemetry_layout.addWidget(self.attitude_label)
         telemetry_layout.addWidget(self.velocity_label)
         telemetry_layout.addWidget(self.position_label)
         telemetry_layout.addWidget(self.battery_label)
-        telemetry_layout.addWidget(QLabel("Vibration:"))
-        telemetry_layout.addLayout(vibe_layout)
+        telemetry_layout.addLayout(status_layout)
         telemetry_layout.addWidget(self.vibe_label)
-        telemetry_layout.addWidget(QLabel("EKF Status:"))
-        telemetry_layout.addLayout(ekf_layout)
         telemetry_layout.addWidget(self.ekf_label)
-        telemetry_layout.addStretch()
+        telemetry_layout.addLayout(record_layout)
         telemetry_layout.addWidget(self.record_button)
+        telemetry_layout.addWidget(self.status_bar)
+        telemetry_layout.addStretch()
 
         # OSD settings tab
         osd_tab = QWidget()
@@ -229,6 +243,7 @@ class VideoTelemetryWindow(QMainWindow):
                     for key, val in self.osd_elements.items()}
         with open('osd_settings.json', 'w') as f:
             json.dump(settings, f)
+        self.status_bar.append("OSD settings saved")
         print("OSD settings saved")
 
     def load_osd_settings(self):
@@ -241,8 +256,10 @@ class VideoTelemetryWindow(QMainWindow):
                         self.osd_elements[key]['enabled'] = settings[key]['enabled']
                         if hasattr(self, 'osd_checkboxes') and key in self.osd_checkboxes:
                             self.osd_checkboxes[key].setChecked(settings[key]['enabled'])
+            self.status_bar.append("OSD settings loaded")
             print("OSD settings loaded")
         else:
+            self.status_bar.append("No OSD settings file found")
             print("No OSD settings file found")
 
     def update_record_button_icon(self):
@@ -262,29 +279,77 @@ class VideoTelemetryWindow(QMainWindow):
     def connect_mavlink(self):
         try:
             self.mavlink_conn = mavutil.mavlink_connection('udp:0.0.0.0:14550')
+            self.status_bar.append("Connected to MAVLink UDP port 14550")
             print("Connected to MAVLink UDP port 14550")
         except Exception as e:
+            self.status_bar.append(f"Failed to connect to MAVLink: {e}")
             print(f"Failed to connect to MAVLink: {e}")
             self.mavlink_conn = None
 
     def toggle_recording(self):
         if not self.is_recording:
             self.is_recording = True
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
             timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.video_writer = cv2.VideoWriter(
-                f'recording_{timestamp}.avi',
-                fourcc,
-                20.0,
-                (self.frame_width, self.frame_height)
+            self.recording_path = f'recording_{timestamp}'
+            osd_file = f'{self.recording_path}_osd.avi'  # Changed to .avi
+            raw_file = f'{self.recording_path}_raw.avi'  # Changed to .avi
+
+            # Try H.264 first, fall back to XVID if it fails
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
+            self.video_writer_osd = cv2.VideoWriter(
+                osd_file, fourcc, 30.0, (self.frame_width, self.frame_height), isColor=True
             )
-            print("Recording started")
+            self.video_writer_raw = cv2.VideoWriter(
+                raw_file, fourcc, 30.0, (self.frame_width, self.frame_height), isColor=True
+            )
+
+            # Check if H.264 failed
+            if not self.video_writer_osd.isOpened() or not self.video_writer_raw.isOpened():
+                self.status_bar.append("H.264 codec failed, falling back to XVID")
+                print("H.264 codec failed, falling back to XVID")
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                self.video_writer_osd = cv2.VideoWriter(
+                    osd_file, fourcc, 30.0, (self.frame_width, self.frame_height), isColor=True
+                )
+                self.video_writer_raw = cv2.VideoWriter(
+                    raw_file, fourcc, 30.0, (self.frame_width, self.frame_height), isColor=True
+                )
+
+            if self.video_writer_osd.isOpened() and self.video_writer_raw.isOpened():
+                self.record_label.setText("Recording: Active")
+                self.status_bar.append(f"Recording started:\n{osd_file}\n{raw_file}")
+                self.open_folder_button.setEnabled(True)
+                print("Recording started")
+            else:
+                self.status_bar.append("Failed to initialize video writers")
+                print("Failed to initialize video writers")
+                self.is_recording = False
+                self.open_folder_button.setEnabled(False)
         else:
             self.is_recording = False
-            if self.video_writer:
-                self.video_writer.release()
+            if self.video_writer_osd:
+                self.video_writer_osd.release()
+            if self.video_writer_raw:
+                self.video_writer_raw.release()
+            self.record_label.setText("Recording: Not active")
+            self.status_bar.append("Recording stopped")
+            self.open_folder_button.setEnabled(False)
             print("Recording stopped")
         self.update_record_button_icon()
+
+    def open_recording_folder(self):
+        folder_path = os.path.dirname(os.path.abspath(f"{self.recording_path}_osd.avi"))
+        if os.path.exists(folder_path):
+            if sys.platform == "win32":
+                os.startfile(folder_path)
+            elif sys.platform == "darwin":  # macOS
+                subprocess.call(["open", folder_path])
+            else:  # Linux
+                subprocess.call(["xdg-open", folder_path])
+            self.status_bar.append(f"Opened folder: {folder_path}")
+        else:
+            self.status_bar.append(f"Folder not found: {folder_path}")
+            print(f"Folder not found: {folder_path}")
 
     def draw_osd(self, frame):
         osd_frame = frame.copy()
@@ -333,8 +398,7 @@ class VideoTelemetryWindow(QMainWindow):
         if self.osd_elements['vibration']['enabled']:
             x, y = self.osd_elements['vibration']['pos']
             bar_height = 50
-            # Vertical bars: green if <30, red if >=30
-            cv2.rectangle(osd_frame, (x, y), (x + 10, y - bar_height), (0, 0, 0), 1)  # Outline
+            cv2.rectangle(osd_frame, (x, y), (x + 10, y - bar_height), (0, 0, 0), 1)
             cv2.rectangle(osd_frame, (x, y - int(abs(self.vibration_data['x']) / 100 * bar_height)), (x + 10, y),
                           (0, 255, 0) if abs(self.vibration_data['x']) < 30 else (0, 0, 255), -1)
             cv2.rectangle(osd_frame, (x + 15, y), (x + 25, y - bar_height), (0, 0, 0), 1)
@@ -361,7 +425,6 @@ class VideoTelemetryWindow(QMainWindow):
         if self.osd_elements['ekf']['enabled']:
             x, y = self.osd_elements['ekf']['pos']
             bar_height = 50
-            # Vertical EKF bars (0-100 scale, green if good, red if bad)
             cv2.rectangle(osd_frame, (x, y), (x + 10, y - bar_height), (0, 0, 0), 1)
             cv2.rectangle(osd_frame, (x, y - int(self.ekf_status['velocity'] * 100)), (x + 10, y),
                           (0, 255, 0) if self.ekf_status['velocity'] < 0.5 else (0, 0, 255), -1)
@@ -403,6 +466,7 @@ class VideoTelemetryWindow(QMainWindow):
     def update_video(self):
         while self.running:
             if not self.cap.isOpened():
+                self.status_bar.append("Video capture not opened")
                 print("Video capture not opened")
                 time.sleep(1)
                 continue
@@ -410,12 +474,18 @@ class VideoTelemetryWindow(QMainWindow):
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.resize(frame, (self.frame_width, self.frame_height))
-                self.current_frame = self.draw_osd(frame)
-                if self.is_recording and self.video_writer:
-                    self.video_writer.write(self.current_frame)
+                self.current_frame_raw = frame
+                self.current_frame_osd = self.draw_osd(frame)
+                if self.is_recording:
+                    if self.video_writer_osd:
+                        self.video_writer_osd.write(self.current_frame_osd)
+                    if self.video_writer_raw:
+                        self.video_writer_raw.write(self.current_frame_raw)
             else:
+                self.status_bar.append("Failed to grab frame")
                 print("Failed to grab frame")
-                self.current_frame = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+                self.current_frame_raw = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+                self.current_frame_osd = self.current_frame_raw.copy()
                 time.sleep(0.1)
 
     def update_telemetry(self):
@@ -451,18 +521,19 @@ class VideoTelemetryWindow(QMainWindow):
                         self.vibration_data['clip'] = msg.clipping_0
                     elif msg_type == 'EKF_STATUS_REPORT':
                         self.ekf_status['flags'] = msg.flags
-                        self.ekf_status['velocity'] = min(msg.velocity_variance, 1.0)  # Cap at 1.0 for display
+                        self.ekf_status['velocity'] = min(msg.velocity_variance, 1.0)
                         self.ekf_status['pos_horiz'] = min(msg.pos_horiz_variance, 1.0)
                         self.ekf_status['pos_vert'] = min(msg.pos_vert_variance, 1.0)
                         self.ekf_status['compass'] = min(msg.compass_variance, 1.0)
 
             except Exception as e:
+                self.status_bar.append(f"Telemetry error: {e}")
                 print(f"Telemetry error: {e}")
                 time.sleep(0.1)
 
     def update_frame(self):
-        if hasattr(self, 'current_frame'):
-            frame = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+        if hasattr(self, 'current_frame_osd'):
+            frame = cv2.cvtColor(self.current_frame_osd, cv2.COLOR_BGR2RGB)
             h, w, ch = frame.shape
             bytes_per_line = ch * w
             qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -505,11 +576,14 @@ class VideoTelemetryWindow(QMainWindow):
     def closeEvent(self, event):
         self.running = False
         self.cap.release()
-        if self.video_writer:
-            self.video_writer.release()
+        if self.video_writer_osd:
+            self.video_writer_osd.release()
+        if self.video_writer_raw:
+            self.video_writer_raw.release()
         if self.mavlink_conn:
             self.mavlink_conn.close()
         self.save_osd_settings()
+        self.status_bar.append("Application closed")
         event.accept()
 
 
